@@ -33,6 +33,8 @@
 
 #include <stdint.h>
 
+#include "zeron.h"
+
 #define OID_EKU_MODSIGN "1.3.6.1.4.1.2312.16.1.2"
 
 static EFI_SYSTEM_TABLE *systab;
@@ -1061,17 +1063,6 @@ EFI_STATUS read_image(EFI_HANDLE image_handle, CHAR16 *ImagePath,
 	UINT64 sourcesize = 0;
 
 	/*
-	 * We need to refer to the loaded image protocol on the running
-	 * binary in order to find our path
-	 */
-	efi_status = BS->HandleProtocol(image_handle, &EFI_LOADED_IMAGE_GUID,
-					(void **)&shim_li);
-	if (EFI_ERROR(efi_status)) {
-		perror(L"Unable to init protocol\n");
-		return efi_status;
-	}
-
-	/*
 	 * Build a new path from the existing one plus the executable name
 	 */
 	efi_status = generate_path_from_image_path(shim_li, ImagePath, PathName);
@@ -1127,23 +1118,26 @@ EFI_STATUS read_image(EFI_HANDLE image_handle, CHAR16 *ImagePath,
 	return efi_status;
 }
 
+
+static EFI_STATUS init_shim_li(EFI_HANDLE image_handle)
+{
+	/*
+	 * We need to refer to the loaded image protocol on the running
+	 * binary in order to find our path
+	 */
+	return BS->HandleProtocol(image_handle, &EFI_LOADED_IMAGE_GUID,
+	                                (void **)&shim_li);
+}
+
 /*
  * Load and run an EFI executable
  */
-EFI_STATUS start_image(EFI_HANDLE image_handle, CHAR16 *ImagePath)
+EFI_STATUS start_image_ex(EFI_HANDLE image_handle, EFI_HANDLE DeviceHandle, EFI_DEVICE_PATH *FilePath, void *data, int datasize)
 {
 	EFI_STATUS efi_status;
 	EFI_IMAGE_ENTRY_POINT entry_point;
 	EFI_PHYSICAL_ADDRESS alloc_address;
 	UINTN alloc_pages;
-	CHAR16 *PathName = NULL;
-	void *data = NULL;
-	int datasize = 0;
-
-	efi_status = read_image(image_handle, ImagePath, &PathName, &data,
-				&datasize);
-	if (EFI_ERROR(efi_status))
-		goto done;
 
 	/*
 	 * We need to modify the loaded image protocol entry before running
@@ -1154,7 +1148,8 @@ EFI_STATUS start_image(EFI_HANDLE image_handle, CHAR16 *ImagePath)
 	/*
 	 * Update the loaded image with the second stage loader file path
 	 */
-	shim_li->FilePath = FileDevicePath(NULL, PathName);
+	shim_li->DeviceHandle = DeviceHandle;
+	shim_li->FilePath = FilePath;
 	if (!shim_li->FilePath) {
 		perror(L"Unable to update loaded image file path\n");
 		efi_status = EFI_OUT_OF_RESOURCES;
@@ -1182,14 +1177,23 @@ EFI_STATUS start_image(EFI_HANDLE image_handle, CHAR16 *ImagePath)
 
 restore:
 	restore_loaded_image();
-done:
-	if (PathName)
-		FreePool(PathName);
-
-	if (data)
-		FreePool(data);
 
 	return efi_status;
+}
+
+/*
+ * Load and run an EFI executable
+ */
+EFI_STATUS start_image(EFI_HANDLE image_handle, CHAR16 *ImagePath) {
+	CHAR16* PathName;
+	void *data;
+	int datasize;
+	EFI_STATUS efi_status = read_image(image_handle, ImagePath, &PathName, &data, &datasize);
+	if (EFI_ERROR(efi_status)) {
+		return efi_status;
+	}
+	EFI_DEVICE_PATH *device_path = FileDevicePath(NULL, PathName);
+	return start_image_ex(image_handle, shim_li->DeviceHandle, device_path, data, datasize);
 }
 
 /*
@@ -1805,10 +1809,22 @@ die:
 		msleep(2000000);
 	}
 
-	/*
-	 * Hand over control to the second stage bootloader
-	 */
-	efi_status = init_grub(image_handle);
+	efi_status = init_shim_li(image_handle);
+	if (EFI_ERROR(efi_status)) {
+		msg = SHIM_INIT;
+		goto die;
+	}
+
+	efi_status = ZeronMain(image_handle);
+	if (efi_status != EFI_SUCCESS) {
+		console_print(L"No zerox-boot: %d\n", efi_status);
+		msleep(2000000);
+
+		/*
+		 * Hand over control to the second stage bootloader
+		 */
+		efi_status = init_grub(image_handle);
+	}
 
 	shim_fini();
 	devel_egress(EFI_ERROR(efi_status) ? EXIT_FAILURE : EXIT_SUCCESS);
